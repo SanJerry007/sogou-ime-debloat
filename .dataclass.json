@@ -1,0 +1,13 @@
+{
+  "_comment": [
+    "Every path in this repo belongs to exactly one class.",
+    "TOOL    = code, README, docs.",
+    "FIXTURE = none in this repo.",
+    "DATA    = anything a real run produced. Never in this repo.",
+    "Enforced by tools/data_boundary.py from the fleet-guards checkout (git config fleet.guards) through .githooks."
+  ],
+  "_audited": "2026-11-19 AUDIT at repo creation. SogouDebloat.ps1 writes only to the local Sogou install, the registry, %LOCALAPPDATA%\\sogoupdf, the Sogou user profile and a scheduled task; it never writes into this repo and has no log file. Its output goes to the console only. So the empty data list is an audited conclusion, not a default.",
+  "data": [],
+  "data_sealed": [],
+  "fixture": []
+}
