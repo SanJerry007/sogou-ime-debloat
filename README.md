@@ -130,7 +130,8 @@ powershell -ExecutionPolicy Bypass -File .\SogouDebloat.ps1 -Uninstall
 ## 说明
 
 - 本项目与搜狗、腾讯无关。脚本只修改你自己电脑上已安装的软件。
-- 脚本里的 AES key 和 IV 是从 `SogouComMgr.exe` 里分析出来的，只用来读写本机的组件配置文件。
+- 仓库里不带任何密钥。读写组件配置所需的密钥由脚本在运行时，从你本机已安装的搜狗程序里现场定位，只在内存里使用，不写盘。
+- 仅供在自己的电脑上个人使用。
 - 风险自负。
 
 ---

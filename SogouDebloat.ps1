@@ -67,7 +67,7 @@ param(
     [switch]$Uninstall,
     [switch]$Auto
 )
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
@@ -89,9 +89,8 @@ if ($Auto) {
 }
 
 # ---------------------------------------------------------------- constants
-# AES-256-CBC key/IV that SogouComMgr.exe uses for Components\ComponentConfig.ini
-$CfgKey = $null  # removed from history: derived at run time since v1.1.0
-$CfgIV  = $null  # removed from history
+# Components\ComponentConfig.ini is base64 of AES-256-CBC. No key ships with this script: it is located at
+# run time inside the user's own Sogou install (see Get-ComponentConfigKey) and never written to disk.
 
 # component bundles to stop loading (bundle id in ComponentConfig.ini -> folder under Components)
 $OffBundles = [ordered]@{
@@ -167,27 +166,72 @@ function Get-SogouVersionDir([string]$root) {
     $d.FullName
 }
 
-function Invoke-Aes([byte[]]$data, [bool]$encrypt) {
+# Plaintext = 16 random bytes + ini text starting with "[system]". In CBC the second block decrypts as
+# D(C2) xor C1, independent of the IV, so a candidate key is confirmed by one block decryption. The IV is
+# never needed either: re-encryption keeps the original first ciphertext block C1 (so Sogou still decrypts
+# its own random prefix) and chains the new text from C1.
+Add-Type -TypeDefinition @'
+using System; using System.Security.Cryptography;
+public static class SogouCfgKey {
+    static readonly byte[] Magic = System.Text.Encoding.ASCII.GetBytes("[system]");
+    public static byte[] Find(byte[] img, byte[] c1, byte[] c2) {
+        using (var aes = Aes.Create()) {
+            aes.Mode = CipherMode.ECB; aes.Padding = PaddingMode.None;
+            var key = new byte[32]; var o = new byte[16];
+            for (int i = 0; i + 32 <= img.Length; i += 4) {
+                int z = 0; for (int j = 0; j < 32 && z < 4; j++) if (img[i + j] == 0) z++;
+                if (z >= 4) continue;                       // keys are high-entropy; skip padding/tables
+                Buffer.BlockCopy(img, i, key, 0, 32);
+                using (var d = aes.CreateDecryptor(key, null)) d.TransformBlock(c2, 0, 16, o, 0);
+                bool ok = true;
+                for (int j = 0; j < Magic.Length; j++) if ((byte)(o[j] ^ c1[j]) != Magic[j]) { ok = false; break; }
+                if (ok) return (byte[])key.Clone();
+            }
+        }
+        return null;
+    }
+}
+'@
+$script:CfgKeyCache = $null
+function Get-ComponentConfigKey([byte[]]$ct) {
+    if ($script:CfgKeyCache) { return $script:CfgKeyCache }
+    $c1 = $ct[0..15]; $c2 = $ct[16..31]
+    # Small core binaries first; the IME core is never neutralized, so the key stays derivable.
+    $sources = @((Join-Path $env:SystemRoot 'SysWOW64\IME\SogouPY\SogouImeBroker.exe'),
+                 (Join-Path $env:SystemRoot 'System32\SogouTSF.ime'), (Join-Path $env:SystemRoot 'SysWOW64\SogouTSF.ime'),
+                 (Join-Path $Ver 'SGTool.exe'), (Join-Path $Comp 'SogouComMgr.exe'))
+    foreach ($s in $sources) {
+        if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { continue }
+        $k = [SogouCfgKey]::Find([IO.File]::ReadAllBytes($s), [byte[]]$c1, [byte[]]$c2)
+        if ($k) { $script:CfgKeyCache = $k; return $k }
+    }
+    throw 'Could not locate the ComponentConfig key in the installed Sogou binaries (unsupported version?).'
+}
+function Invoke-Cbc([byte[]]$key, [byte[]]$iv, [byte[]]$data, [bool]$encrypt) {
     $aes = [System.Security.Cryptography.Aes]::Create()
-    $aes.Key = $CfgKey; $aes.IV = $CfgIV
-    $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'
+    $aes.Key = $key; $aes.IV = $iv; $aes.Mode = 'CBC'; $aes.Padding = 'PKCS7'
     $t = if ($encrypt) { $aes.CreateEncryptor() } else { $aes.CreateDecryptor() }
     try { $t.TransformFinalBlock($data, 0, $data.Length) } finally { $t.Dispose(); $aes.Dispose() }
 }
-# plaintext = 16 random bytes + ini text. Edited as Latin-1 so every byte round-trips untouched.
+# Text is edited as Latin-1 so every byte round-trips untouched.
 $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
 function Read-ComponentConfig([string]$path) {
-    $pt = Invoke-Aes ([Convert]::FromBase64String(([IO.File]::ReadAllText($path)).Trim())) $false
-    [pscustomobject]@{ Prefix = $pt[0..15]; Text = $Latin1.GetString($pt, 16, $pt.Length - 16) }
+    $ct = [Convert]::FromBase64String(([IO.File]::ReadAllText($path)).Trim())
+    $key = Get-ComponentConfigKey $ct
+    $c1 = [byte[]]$ct[0..15]
+    $rest = New-Object byte[] ($ct.Length - 16); [Array]::Copy($ct, 16, $rest, 0, $rest.Length)
+    $pt = Invoke-Cbc $key $c1 $rest $false                        # blocks 2..n, chained from C1
+    [pscustomobject]@{ C1 = $c1; Text = $Latin1.GetString($pt) }
 }
 function Write-ComponentConfig([string]$path, $cfg) {
-    $body = $Latin1.GetBytes($cfg.Text)
-    $pt = New-Object byte[] (16 + $body.Length)
-    [Array]::Copy([byte[]]$cfg.Prefix, 0, $pt, 0, 16); [Array]::Copy($body, 0, $pt, 16, $body.Length)
+    $key = $script:CfgKeyCache
+    $enc = Invoke-Cbc $key ([byte[]]$cfg.C1) ($Latin1.GetBytes($cfg.Text)) $true
+    $out = New-Object byte[] (16 + $enc.Length)
+    [Array]::Copy([byte[]]$cfg.C1, 0, $out, 0, 16); [Array]::Copy($enc, 0, $out, 16, $enc.Length)
     $tmp = "$path.tmp"
-    [IO.File]::WriteAllText($tmp, [Convert]::ToBase64String((Invoke-Aes $pt $true)), $Latin1)
+    [IO.File]::WriteAllText($tmp, [Convert]::ToBase64String($out), $Latin1)
     if ((Read-ComponentConfig $tmp).Text -ne $cfg.Text) { Remove-Item -LiteralPath $tmp -Force; throw 're-encrypted config did not read back identically' }
-    [IO.File]::Replace($tmp, $path, $null)
+    [IO.File]::Replace($tmp, $path, [NullString]::Value)
 }
 function Get-ComponentTable([string]$text) {
     $rows = @{}; $sec = $null; $isCom = $false
