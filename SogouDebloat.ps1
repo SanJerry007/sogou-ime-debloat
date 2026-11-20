@@ -34,10 +34,24 @@
 .PARAMETER ShowComponents
   Only decrypt and print the component table (id / enable / forceenable), then exit.
 
+.PARAMETER Install
+  Apply now, then keep it applied: copies this script and the chosen options to
+  %ProgramData%\SogouDebloat (admin-only) and registers the task SogouDebloat-Watch, which
+  re-runs it at every logon and every 6 hours, so a Sogou upgrade or repair is undone automatically.
+
+.PARAMETER Uninstall
+  Remove the tasks, IFEO blocks, firewall rules and %ProgramData%\SogouDebloat that this script created.
+  Files already removed from Sogou come back only by reinstalling Sogou.
+
+.PARAMETER Auto
+  Used by the SogouDebloat-Watch task: -Apply with the saved options, logging to %ProgramData%\SogouDebloat.
+
 .EXAMPLE
   .\SogouDebloat.ps1                 # dry run
-  .\SogouDebloat.ps1 -Apply          # do it
-  .\SogouDebloat.ps1 -Apply -NoSync -BlockNet
+  .\SogouDebloat.ps1 -Apply          # do it once
+  .\SogouDebloat.ps1 -Install        # do it and keep it done after Sogou updates
+  .\SogouDebloat.ps1 -Install -NoSync -BlockNet
+  .\SogouDebloat.ps1 -Uninstall
   .\SogouDebloat.ps1 -ShowComponents
 #>
 [CmdletBinding()]
@@ -48,11 +62,31 @@ param(
     [switch]$BlockNet,
     [switch]$RemoveVoice,
     [switch]$RemoveKaomoji,
-    [switch]$ShowComponents
+    [switch]$ShowComponents,
+    [switch]$Install,
+    [switch]$Uninstall,
+    [switch]$Auto
 )
+$ScriptVersion = '1.0.0'
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
+
+$StateDir  = Join-Path $env:ProgramData 'SogouDebloat'
+$EnvTask   = 'SogouDebloat-EnvIni'
+$WatchTask = 'SogouDebloat-Watch'
+$OptionsFile = Join-Path $StateDir 'options.json'
+$OptionNames = 'NoCloud', 'NoSync', 'BlockNet', 'RemoveVoice', 'RemoveKaomoji'
+
+if ($Auto) {
+    # Scheduled run: saved options win, output goes to the log.
+    if (Test-Path -LiteralPath $OptionsFile) {
+        $saved = Get-Content -LiteralPath $OptionsFile -Raw | ConvertFrom-Json
+        foreach ($n in $OptionNames) { if ($saved.$n) { Set-Variable -Name $n -Value ([switch]$true) } }
+    }
+    $Apply = [switch]$true
+    try { Start-Transcript -LiteralPath (Join-Path $StateDir 'auto.log') -Force | Out-Null } catch { }
+}
 
 # ---------------------------------------------------------------- constants
 # AES-256-CBC key/IV that SogouComMgr.exe uses for Components\ComponentConfig.ini
@@ -94,9 +128,6 @@ $EnvSet = [ordered]@{
 }
 if ($NoCloud) { $EnvSet['EnableCloudRequest'] = '0' }
 
-$StateDir = Join-Path $env:ProgramData 'SogouDebloat'
-$EnvTask  = 'SogouDebloat-EnvIni'
-
 # ---------------------------------------------------------------- helpers
 $script:Changes = 0; $script:Failures = 0
 function Say([string]$tag, [string]$msg) {
@@ -106,7 +137,7 @@ function Say([string]$tag, [string]$msg) {
 function Act([string]$msg, [scriptblock]$do) {
     $script:Changes++
     if (-not $Apply) { Say 'DO' "(dry) $msg"; return }
-    try { $r = & $do; if (@($r) -notcontains 'warned') { Say 'OK' $msg } }
+    try { $r = & $do; if (@($r) -contains 'warned') { $script:Changes-- } else { Say 'OK' $msg } }
     catch { $script:Failures++; Say 'FAIL' "$msg :: $($_.Exception.Message)" }
 }
 function Invoke-Native([string]$exe, [string[]]$argv) {
@@ -256,6 +287,65 @@ function Test-UserDenyWrite([string]$path) {
         ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::WriteData) })
 }
 
+# State dir: SYSTEM and Administrators full, Users read. Elevated tasks only ever run code from here.
+function Protect-StateDir {
+    if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir | Out-Null }
+    Invoke-Native icacls.exe @($StateDir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX') | Out-Null
+}
+function Test-IsAdmin {
+    ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ---------------------------------------------------------------- install / uninstall
+if ($Uninstall) {
+    if (-not (Test-IsAdmin)) { throw 'Run -Uninstall from an elevated (Administrator) PowerShell.' }
+    foreach ($t in $WatchTask, $EnvTask) {
+        if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $t -Confirm:$false; Say 'OK' "Removed task $t" }
+    }
+    $lm64 = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    $ifeoKey = $lm64.OpenSubKey('SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', $true)
+    foreach ($n in $ifeoKey.GetSubKeyNames()) {
+        $k = $ifeoKey.OpenSubKey($n, $true)
+        if ($k -and $k.GetValue('Debugger') -eq $IfeoTarget) {
+            $k.DeleteValue('Debugger'); $empty = ($k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0); $k.Close()
+            if ($empty) { $ifeoKey.DeleteSubKey($n) }
+            Say 'OK' "Removed IFEO block for $n"
+        } elseif ($k) { $k.Close() }
+    }
+    $ifeoKey.Close()
+    Get-NetFirewallRule -DisplayName 'SogouDebloat block*' -ErrorAction SilentlyContinue | ForEach-Object { Remove-NetFirewallRule -Name $_.Name; Say 'OK' "Removed firewall rule $($_.DisplayName)" }
+    if (Test-Path -LiteralPath $StateDir) { Remove-Item -LiteralPath $StateDir -Recurse -Force -Confirm:$false; Say 'OK' "Removed $StateDir" }
+    Write-Host ''
+    Write-Host 'Removed what this script registered. To get Sogou''s removed files back, reinstall Sogou over the top,'
+    Write-Host 'then run: sc config SogouSvc start= demand   (see README, section 撤销).'
+    return
+}
+
+if ($Install) {
+    if (-not (Test-IsAdmin)) { throw 'Run -Install from an elevated (Administrator) PowerShell.' }
+    Protect-StateDir
+    $installed = Join-Path $StateDir 'SogouDebloat.ps1'
+    if ($PSCommandPath -ne $installed) { Copy-Item -LiteralPath $PSCommandPath -Destination $installed -Force }
+    $opt = [ordered]@{}; foreach ($n in $OptionNames) { $opt[$n] = [bool](Get-Variable -Name $n -ValueOnly) }
+    $opt | ConvertTo-Json | Set-Content -LiteralPath $OptionsFile -Encoding UTF8
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    # conhost --headless keeps the run invisible; the task runs elevated as the installing user, so
+    # HKCU, %LOCALAPPDATA% and the Sogou user profile resolve to that user.
+    $act = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument "--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$installed`" -Auto"
+    $logon = New-ScheduledTaskTrigger -AtLogOn -User $user
+    $every = New-ScheduledTaskTrigger -Daily -At '00:00'
+    $every.Repetition = (New-ScheduledTaskTrigger -Once -At '00:00' -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration (New-TimeSpan -Days 1)).Repetition
+    $pri = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    Register-ScheduledTask -TaskName $WatchTask -Action $act -Trigger @($logon, $every) -Principal $pri -Settings $set -Force `
+        -Description "SogouDebloat $ScriptVersion：登录时和每 6 小时检查搜狗输入法，被更新或修复后自动重新精简 (re-applies after Sogou updates)" | Out-Null
+    Say 'OK' "Installed to $installed and registered task $WatchTask (logon + every 6 h)"
+    Write-Host ''
+    # Fall through: apply now with the same options.
+    $Apply = [switch]$true
+}
+
 # ---------------------------------------------------------------- start
 $Root = Get-SogouRoot
 $Ver  = Get-SogouVersionDir $Root
@@ -271,6 +361,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($Apply -and -not $isAdmin) { throw 'Run this from an elevated (Administrator) PowerShell when using -Apply.' }
 
+Write-Host "SogouDebloat  : v$ScriptVersion"
 Write-Host "Sogou install : $Root"
 Write-Host "Version dir   : $Ver"
 Write-Host ("Mode          : {0}" -f $(if ($Apply) { 'APPLY' } else { 'dry run (add -Apply to change things)' }))
@@ -464,34 +555,42 @@ if ($BlockNet) {
 $envFiles = @(Get-ChildItem -Path (Join-Path $env:USERPROFILE 'AppData\LocalLow\SogouPY.users\*\env.ini') -ErrorAction SilentlyContinue)
 $envDiff = @(); foreach ($ef in $envFiles) { try { $envDiff += Update-EnvIni $ef.FullName $EnvSet $false } catch { Say 'WARN' $_.Exception.Message } }
 if ($envDiff) {
-    Act ("Schedule env.ini edit at next boot: " + (($envDiff | Select-Object -Unique) -join ', ')) {
-        if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir | Out-Null }
-        Invoke-Native icacls.exe @($StateDir, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX') | Out-Null
-        $want = ($EnvSet.Keys | ForEach-Object { "'$_'='$($EnvSet[$_])'" }) -join '; '
-        $files = ($envFiles | ForEach-Object { "'" + ($_.FullName -replace "'", "''") + "'" }) -join ', '
-        $body = @"
+    $want = ($EnvSet.Keys | ForEach-Object { "'$_'='$($EnvSet[$_])'" }) -join '; '
+    $targetsList = ($envFiles | ForEach-Object { "'" + ($_.FullName -replace "'", "''") + "'" }) -join ', '
+    $body = @"
 `$ErrorActionPreference = 'Stop'
 function Update-EnvIni {${function:Update-EnvIni}}
 `$want = [ordered]@{ $want }
 `$log = '$StateDir\envini.log'
 `$ok = `$true
-foreach (`$f in @($files)) {
+foreach (`$f in @($targetsList)) {
     try { `$d = Update-EnvIni `$f `$want `$true; Add-Content -LiteralPath `$log "`$(Get-Date -Format s) `$f :: `$(`$d -join ', ')" }
     catch { `$ok = `$false; Add-Content -LiteralPath `$log "`$(Get-Date -Format s) FAILED `$f :: `$(`$_.Exception.Message)" }
 }
 if (`$ok) { Unregister-ScheduledTask -TaskName '$EnvTask' -Confirm:`$false }
 "@
-        $script = Join-Path $StateDir 'envini.ps1'
-        [IO.File]::WriteAllText($script, $body, (New-Object Text.UTF8Encoding $true))
-        $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$script`""
-        $trg = New-ScheduledTaskTrigger -AtStartup
-        $pri = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $EnvTask -Action $act -Trigger $trg -Principal $pri -Force `
-            -Description 'One-shot: edit Sogou env.ini at startup, then delete this task (SogouDebloat).' | Out-Null
+    $envScript = Join-Path $StateDir 'envini.ps1'
+    $same = (Test-Path -LiteralPath $envScript) -and ([IO.File]::ReadAllText($envScript) -eq $body) -and (Get-ScheduledTask -TaskName $EnvTask -ErrorAction SilentlyContinue)
+    if ($same) { Say 'SKIP' "env.ini edit already scheduled for next boot ($EnvTask): $(($envDiff | Select-Object -Unique) -join ', ')" }
+    else {
+        Act ("Schedule env.ini edit at next boot: " + (($envDiff | Select-Object -Unique) -join ', ')) {
+            Protect-StateDir
+            [IO.File]::WriteAllText($envScript, $body, (New-Object Text.UTF8Encoding $false))
+            $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$envScript`""
+            $trg = New-ScheduledTaskTrigger -AtStartup
+            $pri = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $EnvTask -Action $act -Trigger $trg -Principal $pri -Force `
+                -Description 'SogouDebloat：开机时改一次搜狗 env.ini，成功后删除自己 (one-shot)' | Out-Null
+        }
     }
 } elseif ($envFiles) { Say 'SKIP' 'env.ini already set' }
 
 Write-Host ''
+if ($Auto) {
+    Add-Content -LiteralPath (Join-Path $StateDir 'history.log') ("{0} v{1} Sogou {2}: {3} change(s), {4} failure(s)" -f
+        (Get-Date -Format s), $ScriptVersion, (Split-Path $Ver -Leaf), $script:Changes, $script:Failures)
+    try { Stop-Transcript | Out-Null } catch { }
+}
 if (-not $Apply) { Write-Host "$script:Changes change(s) planned. Run again with -Apply in an elevated PowerShell." }
 else {
     if ($script:Failures) { Write-Host "$script:Failures step(s) FAILED, see above." -ForegroundColor Red }
@@ -499,3 +598,4 @@ else {
     if ($pending) { Write-Host "After the reboot run '.\SogouDebloat.ps1 -Apply' once more to finish: $($pending -join ', ')" }
 }
 if ($script:Failures) { exit 1 }
+exit 0
