@@ -1,5 +1,20 @@
 # sogou-ime-debloat
 
+一个脚本给 Windows 版搜狗输入法去广告、关汪仔、断遥测，只留打字。 Debloat Sogou Pinyin IME on Windows: no ads, no AI assistant, no telemetry, no binary patching.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011-blue?style=flat)](#用法)
+[![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B-blue?style=flat)](#用法)
+[![Tested: Sogou 15.5](https://img.shields.io/badge/Tested-Sogou%2015.5.0.2004-green?style=flat)](docs/how-it-works.md)
+[![No binary patching](https://img.shields.io/badge/Binary%20patching-none-green?style=flat)](docs/how-it-works.md)
+[![Languages](https://img.shields.io/badge/Languages-%E4%B8%AD%E6%96%87%20%2F%20EN-blue?style=flat)](#english-summary)
+[![Last commit](https://img.shields.io/github/last-commit/SanJerry007/sogou-ime-debloat?style=flat)](https://github.com/SanJerry007/sogou-ime-debloat/commits)
+[![Stars](https://img.shields.io/github/stars/SanJerry007/sogou-ime-debloat?style=flat)](https://github.com/SanJerry007/sogou-ime-debloat/stargazers)
+
+[中文](#sogou-ime-debloat) | [English](#english-summary)
+
+---
+
 给 Windows 版搜狗拼音输入法做减法：去掉广告弹窗、系统通知广告、AI 汪仔、联网表情包、PDF 编辑器和右键菜单、游戏中心、桌面宠物、腾讯遥测与广告 SDK、自动升级与回装，只留下打字本身。
 
 不改任何二进制。做法是关掉全局组件开关，切断三条会把东西装回来的路径，用同名目录占住那些程序和 SDK 的位置，再用 IFEO 按程序名拦截，升级到新版本目录也照样生效。原理和启动链见 [docs/how-it-works.md](docs/how-it-works.md)。
@@ -69,6 +84,22 @@ powershell -ExecutionPolicy Bypass -File .\SogouDebloat.ps1 -ShowComponents
 
 覆盖安装会把组件开关恢复成安装包里的默认值。
 
+## 常见问题
+
+**搜狗输入法怎么去广告、关掉弹窗？** 状态栏弹窗、服务端推送弹窗和右下角的系统通知广告都来自商业中心组件和 `biz_helper`、`sgtool.dll` 这一路。脚本把组件开关关掉，再把这几个文件占位，弹窗就不会再出现。
+
+**怎么关闭汪仔（AI 助手）？** 脚本在全局组件配置里关掉汪仔和它捎带的腾讯本地文件索引，并让 `SGWangzai`、`SOGOUSmartAssistant` 无法再被装回或启动。
+
+**联网表情包、图片表情能单独关吗？** 能，它们是独立组件，脚本会关掉并清空目录。本地图片表情会一起消失，颜文字保留。
+
+**SogouCloud.exe 和 SGTool.exe 是什么，能删吗？** `SogouCloud.exe` 是云输入候选，默认保留，只去掉它里面的腾讯 AMS 广告 SDK，加 `-NoCloud` 才整个关掉。`SGTool.exe` 负责用户词库合并和设置界面，不能删，脚本只拿掉它动态加载的遥测和远程配置 DLL。
+
+**搜狗升级以后广告又回来了怎么办？** 脚本禁用了 `SogouSvc` 和组件回装程序，又用 IFEO 按程序名拦截，新版本目录里的同名程序也起不来。真的升级或重装之后再跑一次 `-Apply` 即可。
+
+**会不会把输入法弄坏？** 脚本不改任何二进制，只改注册表、组件配置和目录，所有改动都能按上面的「撤销」步骤还原。先不加参数跑一次演练，看清会改什么再执行。
+
+搜索关键词：搜狗输入法 去广告、搜狗输入法 精简、搜狗输入法 纯净版、关闭汪仔、搜狗 弹窗 广告、搜狗 联网表情包、搜狗 自动升级 关闭、SogouCloud、SGTool、SogouSvc、Sogou Pinyin debloat、Sogou IME remove ads、disable telemetry。
+
 ## 说明
 
 - 本项目与搜狗、腾讯无关。脚本只修改你自己电脑上已安装的软件。
@@ -77,4 +108,8 @@ powershell -ExecutionPolicy Bypass -File .\SogouDebloat.ps1 -ShowComponents
 
 ---
 
-**English summary.** A PowerShell script that strips ads, the AI assistant, online stickers, the PDF suite, games, the desktop pet, toast ads and the self-update/re-install machinery from Sogou Pinyin IME on Windows, without patching any binary. It turns off components in the AES-encrypted global `ComponentConfig.ini`, disables `SogouSvc`, unregisters the shell extension, removes the Tencent telemetry and ad SDK DLLs, replaces bloat executables with same-named directories so nothing can write them back, and blocks them by name through IFEO so a new version directory does not bring them back. Run `SogouDebloat.ps1` for a dry run, then `-Apply` from an elevated PowerShell and reboot.
+## English summary
+
+A PowerShell script that strips ads, the AI assistant, online stickers, the PDF suite, games, the desktop pet, toast ads and the self-update/re-install machinery from Sogou Pinyin IME on Windows, without patching any binary. It turns off components in the AES-encrypted global `ComponentConfig.ini`, disables `SogouSvc`, unregisters the shell extension, removes the Tencent telemetry and ad SDK DLLs, replaces bloat executables with same-named directories so nothing can write them back, and blocks them by name through IFEO so a new version directory does not bring them back. Run `SogouDebloat.ps1` for a dry run, then `-Apply` from an elevated PowerShell and reboot.
+
+What stays: typing itself, user dictionaries and skins, `SGTool.exe` (dictionary merge and settings), cloud candidates (`SogouCloud.exe`, minus its Tencent AMS ad SDK; `-NoCloud` turns it off), voice input (`-RemoveVoice`), kaomoji (`-RemoveKaomoji`) and account sync (`-NoSync`). `-BlockNet` adds outbound firewall rules for SGTool and userNetSchedule. Everything is reversible; see the 撤销 (undo) section above. Tested on Sogou Pinyin 15.5.0.2004 (Windows 10/11, PowerShell 5.1+). Not affiliated with Sogou or Tencent.
