@@ -94,8 +94,45 @@ enable=1           ← 加载开关
 
 组件文件夹反过来处理：把整个目录删掉，在原位置放一个同名的只读空文件，组件解包器就没法再建出这个目录。
 
+## 第二轮：处理之后还剩什么
+
+关掉组件之后，用线程入口地址、模块和日志又看了一遍（这一轮用的是 Codex），结论如下。
+
+**SGTool 里的腾讯遥测 SDK。** SGTool 会动态加载 `beacon_sdk.dll`（灯塔上报）和 `qimei.dll`（设备标识）。处理前它的 49 个线程里，有 33 个入口在 beacon、4 个在 qimei。所有搜狗二进制的导入表和延迟导入表里都没有这两个 DLL，`SGTool.exe` 在 RVA `0x12d45a` 处检查加载结果，失败就走另一个分支。所以把它们换成同名目录后，SGTool 照常运行，线程数降到 9 个左右。
+
+**SogouCloud 里的 AMS 广告 SDK。** `SearchCand.dll` 在 RVA `0x97ea6` 构造 `biz_center\<版本>\libamssdk.dll` 的路径，在 `0x97285` 调 LoadLibrary，找不到导出就返回 false。所以就算商业中心组件已经 `enable=0`，它照样加载。占位之后 SogouCloud 继续运行，云候选也保留。
+
+**`shiply.dll`** 是腾讯 Shiply 远程配置 SDK，原本的使用者 SGBizLauncher 已经被拦，这里一并占位。
+
+**仍在输入法本体里、没法单独拦的部分。** 下面这些代码都在 `SogouPY.ime` 本身里。它以 DLL 形式加载进每个用输入法的程序，防火墙按程序做规则时，没法把它的流量和宿主程序本身的流量分开：
+- `http://ping.pinyin.sogou.com/smartinfo.gif` 和 `imechecksig.gif` 上报。x64 引用点在 `0xeb06f`、`0x14fb5d`、`0x151a32`、`0x19549a`。
+- x86 版有 `http://ime.sogou.com/version.txt` 版本请求，引用点 `0x1301c5`，受一个配置字段门控。
+- 生成 `--appid=pingbackbeacon` 命令交给 SGTool 去发。SGTool 里的 beacon 已经不在了，这条路发不出去。
+
+要把这些也去掉，只能在 DNS 或代理层屏蔽 `ping.pinyin.sogou.com`、`ime.sogou.com` 这类搜狗专用主机，或者改二进制。不建议在全机 hosts 里屏蔽腾讯共用的域名（`rdelivery.qq.com`、`oth.eve.mdt.qq.com`），那样会连带影响别的腾讯软件。
+
+**账号同步。** `userNetSchedule.exe` 不常驻，但每天会被拉起好几次。用不到同步就加 `-NoSync`。
+
+**占用。** 处理后三个常驻进程（SGTool、SogouCloud、SogouImeBroker）合计私有内存不到 80 MB。每个宿主程序只映射 `SogouTSF.ime`、`SogouPY.ime`、`Resource.dll` 三个模块，不可共享的驻留页每个宿主只有零点几 MB。
+
+## IFEO 拦截
+
+占位目录只对当前版本目录有效。搜狗升级会装进一个新的版本目录，原来被拦掉的程序就回来了。脚本因此另外在 `Image File Execution Options\<程序名>` 下设 `Debugger`，指向一个不存在的路径。之后任何用这个文件名创建的进程都会失败，不管是谁、用 CreateProcess、ShellExecute 还是 COM 发起的。只拦 14 个搜狗专用的程序名，不碰 `crashrpt.exe`、`pdfsdk.exe` 这类别的软件也可能用的通用名字。IFEO 管不了 LoadLibrary，所以 DLL 仍然靠占位。
+
+## 设置共享区
+
+运行中的设置放在 `Local\sgime_env_fm1.v3.filemap.sogouime<后缀>` 这个共享内存段里，由 `Local\userenv.mutex.sogouime*` 几个互斥量保护。SGTool 的 `UserEnv::MergeSave`（RVA `0x698820`）流程是：合并、序列化回共享区、写文件、在映射头 `+4` 处 `lock xadd` 递增代际计数。外部程序要可靠地改运行中的设置，需要完整复现这套协议，目前还没解析完，所以脚本用的是开机任务。
+
+## 签名校验
+
+- IME 启动外部程序前确实会做签名检查：x64 启动包装器 `0x1ba610` → `0x1bccd0` → `0x1bfbd0` → `0x1d5240`。
+- 组件 DLL 在 LoadLibrary 之前有一道独立的证书检查：x64 在 `0x2f2984`，用到组件目录里的 `certificate` 文件。
+- `HWSignature.dll` 导出的是 `GenHWID`，是硬件标识生成器，本身不是验签函数。
+- 注册表里的 `NoCheckSignature` 能放宽这整套校验，但不要去设它。
+
+这也是脚本不改二进制的原因之一。
 ## 已知的限制
 
 - 以管理员身份运行新版安装包，会把这些改动全部撤销。之后重跑一次脚本即可。
-- 版本目录或组件版本号变了，脚本会自动找到新路径。
+- 版本目录或组件版本号变了，脚本会自动找到新路径：优先取注册表 `HKLM\SOFTWARE\WOW6432Node\SogouInput` 的 `Version`。
 - 32 位视图里“此电脑”CLSID 下有一条右键菜单挂载项，归 TrustedInstaller 所有，删不掉。它指向的 CLSID 已经删除并拉黑，留下的只是一个空引用。
